@@ -16,6 +16,11 @@ name = "distributed_louvain"
 path = "src/lib.rs"
 
 [[test]]
-name = "mpi_tests"
-path = "tests/mpi_tests.rs"
+name = "distributed_graph"
+path = "tests/distributed_graph.rs"
+harness = false
+
+[[test]]
+name = "distributed_community"
+path = "tests/distributed_community.rs"
 harness = false

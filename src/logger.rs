@@ -1,33 +1,30 @@
-use log::{Level, LevelFilter, Metadata, Record};
+use env_logger::Builder;
+use log::LevelFilter;
+use std::io::Write;
 use std::sync::Once;
+use std::sync::OnceLock;
 
 static INIT: Once = Once::new();
 
-struct SimpleLogger;
+static RANK: OnceLock<usize> = OnceLock::new();
 
-impl log::Log for SimpleLogger {
-    fn enabled(&self, metadata: &Metadata) -> bool {
-        metadata.level() <= Level::Info
-    }
-
-    fn log(&self, record: &Record) {
-        if self.enabled(record.metadata()) {
-            println!(
-                "{} - {}: {}",
-                record.level(),
-                record.target(),
-                record.args()
-            );
-        }
-    }
-
-    fn flush(&self) {}
-}
-
-pub fn init() {
+pub fn init(rank: usize) {
     INIT.call_once(|| {
-        log::set_logger(&SimpleLogger).unwrap();
-        log::set_max_level(LevelFilter::Info);
+        RANK.set(rank).unwrap();
+
+        Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+            .format(|buf, record| {
+                let rank = RANK.get().expect("lgger.rs: RANK not initialized");
+                writeln!(
+                    buf,
+                    "[RANK {}] {} - {}: {}",
+                    rank,
+                    record.level(),
+                    record.target(),
+                    record.args()
+                )
+            })
+            .init();
     });
 }
 
