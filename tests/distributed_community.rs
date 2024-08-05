@@ -1,9 +1,5 @@
 use distributed_louvain::*;
-use mpi::{
-    collective::SystemOperation,
-    traits::{Communicator, CommunicatorCollectives},
-};
-use petgraph::{csr::Csr, visit::IntoNeighbors};
+use mpi::traits::Communicator;
 
 /// Given the size of the MPI topology, and the global number of vertices, compute the row
 /// ownership of every rank
@@ -71,8 +67,9 @@ fn main() -> anyhow::Result<()> {
     let edges = &small_edge_list[edges.0..edges.1];
 
     let dg = DistributedGraph::from_distributed(edges, &world)?;
+    let state_manager = StateManager::new(&dg);
 
-    let dc = DistributedCommunityDetection::new(&dg, &dg);
+    let dc = DistributedCommunityDetection::new(&dg, &dg, state_manager);
 
     let global_mod = dc.global_modularity();
 

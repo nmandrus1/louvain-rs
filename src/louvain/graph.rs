@@ -1,40 +1,29 @@
-use crate::CommunityID;
+use crate::{CommunityID, IterationStep};
 
-use super::{
-    displs_from_counts, LouvainGraph, LouvainMessage, MessageRouter, Owned, OwnershipInfo,
-};
+use super::{displs_from_counts, CommunityState, LouvainGraph, LouvainMessage, MessageRouter};
 
-use indexmap::IndexMap;
-use log::debug;
-use petgraph::{
-    csr::Csr,
-    visit::{EdgeRef, IntoNodeReferences},
-    Directed, IntoWeightedEdge,
-};
+use log::{debug, error, info, trace};
 
-use anyhow::{anyhow, bail};
+use indexmap::{indexset, IndexMap, IndexSet};
+use petgraph::{csr::Csr, visit::EdgeRef, Directed, IntoWeightedEdge};
+
+use anyhow::anyhow;
 
 use mpi::{
     collective::SystemOperation,
     datatype::{Partition, PartitionMut},
     topology::{Process, SimpleCommunicator},
-    traits::{BufferMut, Communicator, CommunicatorCollectives, Equivalence, PartitionedBuffer},
+    traits::{Communicator, CommunicatorCollectives, Equivalence, PartitionedBuffer},
     Count, Rank,
 };
 
 /// Newtype to represent vertex ids
-#[derive(Default, Debug, Clone, Copy, PartialEq, Eq, Equivalence, PartialOrd, Ord)]
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq, Equivalence, PartialOrd, Ord, Hash)]
 pub struct VertexID(pub usize);
 
 impl From<usize> for VertexID {
     fn from(value: usize) -> Self {
         Self(value)
-    }
-}
-
-impl Owned for VertexID {
-    fn owner<I: OwnershipInfo>(&self, info: &I) -> Rank {
-        info.owner_of_vertex(*self)
     }
 }
 
@@ -67,6 +56,8 @@ pub struct DistributedInfo<'a> {
 
     global_vcount: usize,
     global_ecount: usize,
+
+    most_vertices_owned_by_a_process: Option<usize>,
 }
 
 impl std::fmt::Debug for DistributedInfo<'_> {
@@ -113,6 +104,16 @@ impl<'a> DistributedInfo<'a> {
         self.owned_rows.1 - self.owned_rows.0
     }
 
+    fn max_vertices_owned_by_any_proc(&self) -> usize {
+        self.most_vertices_owned_by_a_process.unwrap_or_else(|| {
+            self.row_ownership
+                .iter()
+                .map(|(start, end)| end - start)
+                .max()
+                .unwrap_or(0)
+        })
+    }
+
     /// Given a vtx or a community, determine who owns it
     /// by searching the row_ownership vector
     fn owner_of(&self, vtx: usize) -> Rank {
@@ -150,17 +151,8 @@ impl<'a> DistributedInfo<'a> {
             // this field needs to be set later with the proper global edge count
             // this can only be done after all the edges have been processed
             global_ecount: 0,
+            most_vertices_owned_by_a_process: None,
         }
-    }
-}
-
-impl OwnershipInfo for DistributedInfo<'_> {
-    fn owner_of_vertex(&self, vtx: VertexID) -> Rank {
-        self.owner_of(vtx.0)
-    }
-
-    fn owner_of_community(&self, community: CommunityID) -> Rank {
-        self.owner_of(community.0)
     }
 }
 
@@ -180,21 +172,39 @@ pub struct DistributedGraph<'a> {
 impl<'a> DistributedGraph<'a> {
     /// Builds the graph by communicating with MPI Processes
     pub fn from_distributed(edges: &[Edge], world: &'a SimpleCommunicator) -> anyhow::Result<Self> {
+        info!("Building DistributedGraph from {} edges", edges.len());
         let global_vcount = Self::compute_global_graph_info(edges, world)?;
+        info!("Computed global vertex count: {}", global_vcount);
 
         let mut info = DistributedInfo::init(world, global_vcount);
+        debug!("Initialized DistributedInfo: {:?}", info);
 
         let sorted_edges = Self::distribute_and_gather_local_edges(edges, &info)?;
-
-        // global ecount
-        world.all_reduce_into(
-            &sorted_edges.len(),
-            &mut info.global_ecount,
-            SystemOperation::sum(),
+        info!(
+            "Distributed and gathered {} local edges",
+            sorted_edges.len()
         );
 
-        let csr = Csr::from_sorted_edges(&sorted_edges)
-            .map_err(|_| anyhow!("Failed to build CSR because edges are not sorted"))?;
+        // global ecount
+        let mut global_ecount = 0;
+        world.all_reduce_into(
+            &sorted_edges.len(),
+            &mut global_ecount,
+            SystemOperation::sum(),
+        );
+        info.global_ecount = global_ecount;
+        info!("Computed global edge count: {}", global_ecount);
+
+        let csr = Csr::from_sorted_edges(&sorted_edges).map_err(|_| {
+            let err = anyhow!("Failed to build CSR because edges are not sorted");
+            error!("{}", err);
+            err
+        })?;
+        debug!(
+            "Built CSR graph with {} nodes and {} edges",
+            csr.node_count(),
+            csr.edge_count()
+        );
 
         Ok(Self {
             local_vcount: info.local_vcount(),
@@ -206,6 +216,7 @@ impl<'a> DistributedGraph<'a> {
 
     /// number of edges between our owned nodes and all other nodes in the graph
     pub fn edge_count(&self) -> usize {
+        trace!("Returning local edge count: {}", self.local_ecount);
         self.local_ecount
     }
 
@@ -216,11 +227,13 @@ impl<'a> DistributedGraph<'a> {
         edges: &[Edge],
         world: &SimpleCommunicator,
     ) -> anyhow::Result<usize> {
+        debug!("Computing global graph info");
         let local_max_vtx = edges
             .iter()
             .map(|e| std::cmp::max(e.0, e.1))
             .max()
             .unwrap_or_default();
+        debug!("Local max vertex: {:?}", local_max_vtx);
 
         // communicate max vtx and determine how many vertices are in the total distributed graph
         let mut global_max_vtx: usize = usize::MAX;
@@ -229,15 +242,21 @@ impl<'a> DistributedGraph<'a> {
             &mut global_max_vtx,
             SystemOperation::max(),
         );
+        debug!("Global max vertex after reduction: {}", global_max_vtx);
 
         // error checking: return global_max_vtx + 1 if MPI call was successful
         // or an error if it was not set properly
         if global_max_vtx == 0 {
+            info!("Graph is empty");
             Ok(0)
         } else if global_max_vtx == usize::MAX {
-            bail!("Failed to determine global graph info")
+            let err = anyhow!("Failed to determine global graph info");
+            error!("{}", err);
+            Err(err)
         } else {
-            Ok(global_max_vtx + 1)
+            let result = global_max_vtx + 1;
+            info!("Computed global vertex count: {}", result);
+            Ok(result)
         }
     }
 
@@ -247,22 +266,23 @@ impl<'a> DistributedGraph<'a> {
         info: &DistributedInfo,
         edges: &[Edge],
     ) -> (Vec<Edge>, Vec<Count>, Vec<Count>) {
+        debug!("Partitioning {} edges by rank", edges.len());
         // organize edges by rank
         let mut rank_edges = IndexMap::<usize, Vec<Edge>>::with_capacity(info.size);
 
         edges.iter().for_each(|edge| {
-            let rank1 = info.owner_of_vertex(edge.0) as usize;
-            let rank2 = info.owner_of_vertex(edge.1) as usize;
+            let rank1 = info.owner_of(edge.0 .0) as usize;
+            let rank2 = info.owner_of(edge.1 .0) as usize;
 
             // compute both directions of the edge
             rank_edges.entry(rank1).or_default().push(*edge);
+            trace!("Assigned edge {:?} to rank {}", edge, rank1);
 
             // self loops are added once
             if edge.0 != edge.1 {
-                rank_edges
-                    .entry(rank2)
-                    .or_default()
-                    .push(Edge(edge.1, edge.0, edge.2));
+                let reverse_edge = Edge(edge.1, edge.0, edge.2);
+                rank_edges.entry(rank2).or_default().push(reverse_edge);
+                trace!("Assigned reverse edge {:?} to rank {}", reverse_edge, rank2);
             }
         });
 
@@ -278,6 +298,12 @@ impl<'a> DistributedGraph<'a> {
             counts[rank] = count;
             displs[rank] = total_edges;
             total_edges += count;
+            trace!(
+                "Rank {}: count = {}, displacement = {}",
+                rank,
+                count,
+                displs[rank]
+            );
         }
 
         // be sure that we flatten by rank
@@ -291,6 +317,10 @@ impl<'a> DistributedGraph<'a> {
             })
             .collect();
 
+        debug!(
+            "Partitioned edges: total = {}, counts = {:?}",
+            total_edges, counts
+        );
         (buf, counts, displs)
     }
 
@@ -299,38 +329,45 @@ impl<'a> DistributedGraph<'a> {
         info: &DistributedInfo,
         msg: &M,
     ) -> (Vec<Count>, Vec<Count>) {
+        debug!("Gathering incoming edge counts");
         // initialize buffer and send counts to all processes
         let mut recv_counts = vec![0; info.size];
         info.world.all_to_all_into(msg.counts(), &mut recv_counts);
+        debug!("Received edge counts: {:?}", recv_counts);
 
         let recv_displs = displs_from_counts(&recv_counts);
+        debug!("Calculated displacements: {:?}", recv_displs);
         (recv_counts, recv_displs)
     }
 
     /// Build the send and receive buffer based on the edge list and our Distributed setup
     /// and perform communication, returning a complete sorted list of edges belonging to this process
-    ///
     fn distribute_and_gather_local_edges(
         edges: &[Edge],
         info: &DistributedInfo,
     ) -> anyhow::Result<Vec<Edge>> {
+        info!("Distributing and gathering local edges");
         // build send buffer
         let (send_buf, send_counts, send_displs) = Self::partition_edges_by_rank(info, edges);
-
-        debug!("\n{:?}\n{:?}\n{:?}\n", send_buf, send_counts, send_displs);
+        debug!("Send buffer prepared: {} edges", send_buf.len());
 
         let send = Partition::new(&send_buf, send_counts, send_displs);
 
         // build recv buffer
-        let (recv_counts, recv_displs) = Self::gather_incoming_edge_counts(&info, &send);
-        let mut recv_buf = vec![Edge::default(); recv_counts.iter().sum::<i32>().try_into()?];
+        let (recv_counts, recv_displs) = Self::gather_incoming_edge_counts(info, &send);
+        let recv_total: i32 = recv_counts.iter().sum();
+        debug!("Expecting to receive {} edges", recv_total);
+        let mut recv_buf = vec![Edge::default(); recv_total.try_into()?];
         let mut recv = PartitionMut::new(&mut recv_buf, recv_counts, recv_displs);
 
         // communicate
+        info!("Performing all_to_all_varcount communication");
         info.world.all_to_all_varcount_into(&send, &mut recv);
+        debug!("Completed all_to_all_varcount communication");
 
         // sort edges and create graph
         recv_buf.sort_unstable_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+        info!("Sorted {} received edges", recv_buf.len());
 
         // return data buffer
         Ok(recv_buf)
@@ -339,91 +376,141 @@ impl<'a> DistributedGraph<'a> {
 
 impl<'a> LouvainGraph for DistributedGraph<'a> {
     fn local_vertex_count(&self) -> usize {
+        trace!("Returning local vertex count: {}", self.local_vcount);
         self.local_vcount
     }
 
     fn global_vertex_count(&self) -> usize {
+        trace!(
+            "Returning global vertex count: {}",
+            self.info.global_vcount()
+        );
         self.info.global_vcount()
     }
 
     fn global_edge_count(&self) -> usize {
+        trace!("Returning global edge count: {}", self.info.global_ecount());
         self.info.global_ecount()
     }
 
     fn weighted_degree(&self, vertex: usize) -> f64 {
-        self.inner.edges(vertex).map(|e| e.weight()).sum()
+        let degree = self.inner.edges(vertex).map(|e| e.weight()).sum();
+        trace!("Computed weighted degree for vertex {}: {}", vertex, degree);
+        degree
     }
 
-    fn neighbors(&self, vertex: usize) -> impl Iterator<Item = (usize, f64)> {
-        self.inner.edges(vertex).map(|e| (e.target(), *e.weight()))
-    }
-
-    fn vertices(&self) -> impl Iterator<Item = usize> {
-        // filters the nodes by ownership of this graph
+    fn neighbors(&self, vertex: VertexID) -> impl Iterator<Item = (VertexID, f64)> {
+        trace!("Getting neighbors for vertex {:?}", vertex);
         self.inner
-            .node_references()
-            .filter_map(|(id, _)| (self.info.owner_of(id) as usize == self.info.rank).then_some(id))
+            .edges(vertex.0)
+            .map(|e| (e.target().into(), *e.weight()))
+    }
+
+    fn vertices(&self) -> impl Iterator<Item = VertexID> {
+        trace!("Getting vertices owned by this graph");
+        (self.info.owned_rows.0..self.info.owned_rows.1)
+            .map(|v| VertexID(v))
+            .into_iter()
+    }
+
+    // TODO: Random order of vertices
+    fn vertex_feed(&self) -> impl Iterator<Item = IterationStep> {
+        // we need this many items of IterationStep::SyncOnly at the end
+        let difference = self.info.max_vertices_owned_by_any_proc() - self.local_vertex_count();
+
+        self.vertices()
+            .map(|v| IterationStep::Process(v))
+            .chain((0..difference).map(|_| IterationStep::SyncOnly))
     }
 
     fn is_local_vertex(&self, vertex: usize) -> bool {
-        self.info.rank == self.info.owner_of(vertex) as usize
+        let is_local = self.info.rank == self.info.owner_of(vertex) as usize;
+        trace!("Checking if vertex {} is local: {}", vertex, is_local);
+        is_local
     }
-}
 
-/// the graph can determine ownership through info
-/// the graph makes sense too for being the message router
-impl OwnershipInfo for DistributedGraph<'_> {
     fn owner_of_vertex(&self, vtx: VertexID) -> Rank {
-        self.info.owner_of_vertex(vtx)
+        let owner = self.info.owner_of(vtx.0);
+        trace!("Owner of vertex {:?}: Rank {}", vtx, owner);
+        owner
     }
 
     fn owner_of_community(&self, community: CommunityID) -> Rank {
-        self.info.owner_of_community(community)
+        let owner = self.info.owner_of(community.0);
+        trace!("Owner of community {:?}: Rank {}", community, owner);
+        owner
     }
 }
 
 impl MessageRouter for DistributedGraph<'_> {
-    fn route(&self, message: LouvainMessage) -> Vec<Rank> {
+    fn route<S: CommunityState>(&self, message: LouvainMessage, state: &S) -> IndexSet<Rank> {
         match message {
-            LouvainMessage::CommunityUpdate(_update) => todo!(),
-            LouvainMessage::VertexMovement(_update) => todo!(),
-            LouvainMessage::NeighborInfo(_update) => todo!(),
+            LouvainMessage::CommunityInfo(update) => {
+                // update all ranks with a vtx in this community
+                let mut set: IndexSet<Rank> = IndexSet::with_capacity(self.size() / 2);
+
+                for vtx in state.get_community_members(&update.id) {
+                    set.insert(self.owner_of_vertex(*vtx));
+                }
+                set
+            }
+            // only send to the owner of the target community
+            LouvainMessage::VertexMovement(movement) => {
+                indexset! {self.owner_of_community(movement.community_id)}
+            }
+            LouvainMessage::NeighborInfo(info) => {
+                let mut set = IndexSet::with_capacity(self.size() / 2);
+
+                for (vtx, _) in self.neighbors(info.vertex_id) {
+                    set.insert(self.owner_of_vertex(vtx));
+                }
+
+                set
+            }
         }
     }
 
     fn process_at_rank(&self, rank: Rank) -> Process {
+        trace!("Getting process for rank {}", rank);
         self.info.world.process_at_rank(rank)
     }
 
     fn size(&self) -> usize {
+        trace!("Getting communicator size: {}", self.info.size);
         self.info.size
     }
 
     fn this_process(&self) -> Process {
+        trace!("Getting this process");
         self.info.world.this_process()
     }
 
     fn distribute_counts(&self, buf: &[Count], recv_counts: &mut [Count]) -> anyhow::Result<()> {
+        debug!("Distributing counts, buffer length: {}", buf.len());
         if buf.len() != self.size() {
-            bail!("Buffer length must match topology")
+            let err = anyhow!("Buffer length must match topology");
+            error!("{}", err);
+            return Err(err);
         }
 
         self.info
             .world
             .all_reduce_into(buf, recv_counts, SystemOperation::sum());
+        debug!("Distributed counts: {:?}", recv_counts);
 
         Ok(())
     }
 
     fn global_modularity(&self, partial: f64) -> f64 {
+        debug!("Computing global modularity, partial: {}", partial);
         let mut sum = f64::default();
         self.info
             .world
             .all_reduce_into(&partial, &mut sum, SystemOperation::sum());
+        info!("Computed global modularity: {}", sum);
         sum
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -500,6 +587,7 @@ mod tests {
                 row_ownership,
                 global_vcount,
                 global_ecount,
+                most_vertices_owned_by_a_process: None,
             })
         }
     }
@@ -553,6 +641,7 @@ mod tests {
             row_ownership: dist,
             global_vcount: 40,
             global_ecount: 69,
+            most_vertices_owned_by_a_process: None,
         };
 
         let mut expected_owner = 0;
@@ -576,6 +665,7 @@ mod tests {
             row_ownership: dist,
             global_vcount: 10,
             global_ecount: 5,
+            most_vertices_owned_by_a_process: None,
         };
 
         let mut expected_owner = 0;

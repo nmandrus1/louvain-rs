@@ -81,11 +81,11 @@ fn main() -> anyhow::Result<()> {
     assert_eq!(dg.info.global_vcount(), 16);
 
     for vtx in dg.vertices() {
-        if rank == dg.info.owner_of_vertex(VertexID(vtx)) as usize {
+        if rank == dg.owner_of_vertex(vtx) as usize {
             assert!(dg
                 .neighbors(vtx)
-                .map(|(neigh, _)| neigh)
-                .eq(csr.neighbors(vtx)));
+                .map(|(neigh, _)| neigh.0)
+                .eq(csr.neighbors(vtx.0)));
         }
     }
 

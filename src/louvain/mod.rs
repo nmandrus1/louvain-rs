@@ -1,13 +1,14 @@
 mod communities;
+mod communitystate;
 mod graph;
 mod messagemanager;
-mod mpicommlayer;
 mod traits;
 
 use messagemanager::*;
 pub use traits::*;
 
 pub use communities::*;
+pub use communitystate::*;
 pub use graph::*;
 
 use mpi::Count;

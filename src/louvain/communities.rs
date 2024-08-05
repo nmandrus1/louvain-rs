@@ -1,88 +1,178 @@
-use std::collections::HashSet;
+use crate::{MessageManagerTrait, MessageRouter, VertexID};
 
-use indexmap::IndexMap;
-
-use crate::MessageRouter;
-
-use super::{LouvainGraph, MessageManager, Owned, OwnershipInfo};
+use super::{
+    CommunityInfo, CommunityState, LouvainGraph, MessageManager, NeighborInfo, VertexMovement,
+};
 
 use mpi::traits::Equivalence;
 
-#[derive(Default, Debug, Clone, Copy, PartialEq, Eq, Equivalence)]
-pub struct CommunityID(pub usize);
+use log::{debug, info};
 
-impl From<usize> for CommunityID {
-    fn from(value: usize) -> Self {
-        Self(value)
-    }
-}
-
-impl Owned for CommunityID {
-    fn owner<I: OwnershipInfo>(&self, info: &I) -> mpi::Rank {
-        info.owner_of_community(*self)
-    }
-}
-
-/// Represents a Community in our Graph
-pub struct Community {
-    id: CommunityID,
-    internal_weight: f64,
-    total_weight: f64,
-    vertices: HashSet<usize>,
-}
-
-impl Community {
-    /// initialize a community from a vertex
-    fn from_vtx(id: CommunityID, total_weight: f64) -> Self {
-        Self {
-            id,
-            internal_weight: 0.0,
-            total_weight,
-            vertices: HashSet::new(),
-        }
-    }
+pub enum IterationStep {
+    Process(VertexID),
+    SyncOnly,
 }
 
 /// struct responsible for carrying out distributed Louvain Method
-pub struct DistributedCommunityDetection<'a, G: LouvainGraph, R: MessageRouter> {
+pub struct DistributedCommunityDetection<'a, G: LouvainGraph, R: MessageRouter, S: CommunityState> {
     graph: &'a G,
-    owned_communities: IndexMap<usize, Community>,
     message_manager: MessageManager<'a, R>,
+    state: S,
 }
 
-impl<'a, G: LouvainGraph, R: MessageRouter> DistributedCommunityDetection<'a, G, R> {
-    pub fn new(graph: &'a G, router: &'a R) -> Self {
-        let mut owned_communities = IndexMap::with_capacity(graph.local_vertex_count());
-        graph.vertices().for_each(|v| {
-            owned_communities
-                .entry(v)
-                .or_insert(Community::from_vtx(v.into(), graph.weighted_degree(v)));
-        });
+impl<'a, G: LouvainGraph, R: MessageRouter, S: CommunityState>
+    DistributedCommunityDetection<'a, G, R, S>
+{
+    pub fn new(graph: &'a G, router: &'a R, state: S) -> Self {
+        info!("Creating new DistributedCommunityDetection instance");
 
         Self {
             graph,
-            owned_communities,
+            state,
             message_manager: MessageManager::new(router),
         }
     }
 
-    pub fn one_level(&mut self) {}
+    pub fn one_level(&mut self) {
+        info!("Starting one_level of community detection");
+        self.iterate();
 
-    /// calculate modlarity as the sum of each community's contribution
+        info!("Completed one_level of community detection");
+    }
+
     fn local_modularity(&self) -> f64 {
+        debug!("Calculating local modularity");
         let m2 = self.graph.global_edge_count() as f64 * 2.0;
 
-        self.owned_communities
-            .iter()
-            .filter_map(|(_, comm)| {
+        let result = self
+            .state
+            .local_communities()
+            .map(|id| self.state.get_local_community(id))
+            .filter_map(|comm| {
                 (comm.total_weight > 0.0)
                     .then_some((comm.internal_weight / m2) - (comm.total_weight / m2).powi(2))
             })
-            .sum()
+            .sum();
+
+        debug!("Local modularity calculated: {}", result);
+        result
     }
 
     pub fn global_modularity(&self) -> f64 {
+        info!("Calculating global modularity");
         let partial = self.local_modularity();
-        self.message_manager.global_modularity(partial)
+        let result = self.message_manager.global_modularity(partial);
+        result
     }
+
+    fn iterate(&mut self) {
+        self.graph.vertex_feed().for_each(|step| {
+            let processed_vertex = match step {
+                IterationStep::Process(vtx) => {
+                    // returns Some(vtx) if the vertex was moved
+                    // None if it stayed in its community
+                    todo!()
+                }
+
+                // move on to sync stage
+                IterationStep::SyncOnly => None,
+            };
+
+            self.syncrhonize(processed_vertex);
+        });
+    }
+
+    fn syncrhonize(&mut self, processed_vertex: Option<VertexID>) -> anyhow::Result<()> {
+        {
+            let state = &mut self.state;
+            let message_manager = &mut self.message_manager;
+
+            message_manager.exchange_vertex_movements()?;
+            let movements = self.message_manager.get_received_vertex_movements();
+            Self::process_movements(movements, state);
+        }
+
+        {
+            let state = &mut self.state;
+            let message_manager = &mut self.message_manager;
+            // queue and buffer all messages
+            Self::queue_community_updates(message_manager, state);
+
+            if let Some(vtx) = processed_vertex {
+                let info = NeighborInfo {
+                    vertex_id: vtx,
+                    community_id: *state.community_of(&vtx),
+                };
+                Self::queue_vertex_neighbor_updates(info, message_manager, state);
+            }
+
+            // send messages
+            message_manager.exchange_other_messages()?;
+            let updates = message_manager.get_received_community_updates();
+            let info = message_manager.get_received_neighbor_info();
+
+            // process incoming updates
+            Self::process_community_updates(updates, state);
+            Self::process_neighbor_info(info, state);
+        }
+
+        Ok(())
+    }
+
+    /// for all communities that have been updates, send out the
+    /// updated info to all the necessary ranks
+    #[inline]
+    fn queue_community_updates(manager: &mut MessageManager<'a, R>, state: &S) {
+        // TODO: test this function
+        state.get_updated_communities().for_each(|comm_id| {
+            manager.queue_community_update(state.get_local_community(&comm_id).get_info(), state)
+        });
+    }
+
+    // TODO: Test
+    #[inline]
+    fn queue_vertex_neighbor_updates(
+        info: NeighborInfo,
+        manager: &mut MessageManager<'a, R>,
+        state: &S,
+    ) {
+        manager.queue_neighbor_info(info, state)
+    }
+
+    /// processes all of the received movements from the message manager,
+    /// and populates the vector of updated communities
+    #[inline]
+    fn process_movements<'recv>(
+        movements: impl Iterator<Item = &'recv VertexMovement>,
+        state: &mut S,
+    ) {
+        state.batch_process_vertex_movements(movements);
+    }
+
+    // Receive info from remote processes about communities we are keeping track of
+    #[inline]
+    fn process_community_updates<'recv>(
+        updates: impl Iterator<Item = &'recv CommunityInfo>,
+        state: &mut S,
+    ) {
+        state.batch_process_community_update(updates)
+    }
+
+    // Receive info from remote processes about vertices whose communities have changed
+    #[inline]
+    fn process_neighbor_info<'recv>(
+        info: impl Iterator<Item = &'recv NeighborInfo>,
+        state: &mut S,
+    ) {
+        state.batch_process_neighor_info(info)
+    }
+}
+
+#[cfg(test)]
+mod test {
+
+    // test initialization
+    // test neighbor computation
+    // test best community
+    // test vertex insertion/removal
 }
